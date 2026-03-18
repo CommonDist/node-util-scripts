@@ -1,0 +1,11 @@
+{
+  "name": "node-util-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Utility scripts for data aggregation and indexing",
+  "license": "MIT",
+  "scripts": {
+    "lint": "echo 'no lint configured'",
+    "test": "echo 'no tests configured'"
+  }
+}
