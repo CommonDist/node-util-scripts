@@ -1,0 +1,189 @@
+# ──────────────────────────────────────────────────────────────
+# Feed Sync – hourly RSS harvester
+# Runs on a public repo. No project-specific references.
+# ──────────────────────────────────────────────────────────────
+name: Feed Sync
+
+on:
+  schedule:
+    - cron: '15 * * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max sources to process'
+        required: false
+        default: '90'
+      concurrency:
+        description: 'Parallel fetch limit'
+        required: false
+        default: '6'
+      batch_id:
+        description: 'Override batch identifier'
+        required: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: sync-feeds
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
+      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+      BATCH_ID: ${{ inputs.batch_id || github.run_id }}
+      FEED_LIMIT: ${{ inputs.limit || '90' }}
+      FEED_CONCURRENCY: ${{ inputs.concurrency || '6' }}
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --no-save rss-parser p-limit
+
+      - name: Harvest feeds
+        id: harvest
+        run: |
+          node - <<'SCRIPT'
+          const crypto = require('crypto');
+          const RSSParser = require('rss-parser');
+          const pLimit = require('p-limit').default || require('p-limit');
+          const fs = require('fs');
+
+          const BASE = (process.env.GHA_BASE_URL || '').replace(/\/+$/, '');
+          const TOKEN = process.env.BRIDGE_TOKEN || '';
+          const BATCH = process.env.BATCH_ID || `s-${Date.now()}`;
+          const LIMIT = Math.min(Math.max(Number(process.env.FEED_LIMIT || '90'), 1), 200);
+          const CONC = Math.min(Math.max(Number(process.env.FEED_CONCURRENCY || '6'), 1), 12);
+          const BATCH_SIZE = 200;
+
+          if (!BASE || !TOKEN) { console.log('[E] 0x00'); process.exit(1); }
+
+          const parser = new RSSParser({
+            timeout: 10000,
+            maxRedirects: 3,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; FeedSync/1.0)',
+              'Accept': 'application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.1',
+            },
+          });
+
+          async function api(method, path, body) {
+            const opts = {
+              method,
+              headers: {
+                'Authorization': `Bearer ${TOKEN}`,
+                'Content-Type': 'application/json',
+              },
+            };
+            if (body) opts.body = JSON.stringify(body);
+            const r = await fetch(`${BASE}${path}`, opts);
+            if (!r.ok) throw new Error(`0x${r.status.toString(16)}`);
+            return method === 'GET' ? r.json() : undefined;
+          }
+
+          async function run() {
+            const t0 = Date.now();
+            const { tasks } = await api('GET', `/api/bridge/tasks?limit=${LIMIT}`);
+
+            const limit = pLimit(CONC);
+            let ok = 0, err = 0;
+            const articles = [];
+
+            await Promise.all(tasks.map(task => limit(async () => {
+              try {
+                const res = await fetch(task.sourceUrl, {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; FeedSync/1.0)',
+                    'Accept': 'application/rss+xml, application/atom+xml, */*;q=0.1',
+                  },
+                  signal: AbortSignal.timeout(10000),
+                });
+                if (!res.ok) { err++; return; }
+                const xml = await res.text();
+                const feed = await parser.parseString(xml);
+                const now = new Date().toISOString();
+
+                for (const item of (feed.items || [])) {
+                  const title = String(item.title || '').trim();
+                  const url = String(item.link || '').trim();
+                  if (!title || !url) continue;
+                  const pub = item.pubDate ? new Date(item.pubDate) : new Date();
+                  articles.push({
+                    source_id: task.sourceId,
+                    source_url: task.sourceUrl,
+                    url,
+                    title: title.slice(0, 500),
+                    summary: String(item.contentSnippet || item.summary || '').slice(0, 2000),
+                    published_at: isFinite(pub.getTime()) ? pub.toISOString() : now,
+                    source_domain: task.domain,
+                    source_vertical: task.categoryVertical,
+                    source_category: task.primaryCategory || '',
+                    source_lang: task.lang,
+                    source_weight: task.weight,
+                    content_hash: crypto.createHash('sha256').update(`${title}::${url}`).digest('hex'),
+                    fetched_at: now,
+                  });
+                }
+                ok++;
+              } catch { err++; }
+            })));
+
+            // Push in batches
+            for (let i = 0; i < articles.length; i += BATCH_SIZE) {
+              try {
+                await api('POST', '/api/bridge/push', { articles: articles.slice(i, i + BATCH_SIZE) });
+              } catch { console.log('[E] 0x03'); }
+            }
+
+            const ms = Date.now() - t0;
+
+            await api('POST', '/api/bridge/report', {
+              source: 'feed-sync',
+              pipeline: 'rss',
+              total_sources: tasks.length,
+              sources_ok: ok,
+              sources_error: err,
+              new_records: articles.length,
+              duration_ms: ms,
+              run_id: BATCH,
+            }).catch(() => {});
+
+            await api('POST', '/api/bridge/heartbeat', {
+              source: 'feed-sync',
+              status: 'ok',
+              batchId: BATCH,
+            }).catch(() => {});
+
+            if (articles.length > 0) {
+              await api('POST', '/api/bridge/signal', {}).catch(() => {});
+            }
+
+            console.log(`[sync] t=${tasks.length} ok=${ok} e=${err} n=${articles.length} ms=${ms}`);
+
+            // Write step summary
+            const summary = [
+              '## Feed Sync',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Sources | ${tasks.length} |`,
+              `| OK | ${ok} |`,
+              `| Errors | ${err} |`,
+              `| New | ${articles.length} |`,
+              `| Duration | ${(ms / 1000).toFixed(1)}s |`,
+            ].join('\n');
+
+            const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+            if (summaryPath) {
+              fs.appendFileSync(summaryPath, summary + '\n');
+            }
+          }
+
+          run().catch(() => { console.log('[E] 0x0F'); process.exit(1); });
+          SCRIPT

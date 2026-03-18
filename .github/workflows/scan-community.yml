@@ -1,0 +1,639 @@
+# Community content scanner — scheduled collection + analysis
+# Requires: GHA_BASE_URL, BRIDGE_TOKEN, BRIDGE_SOCIAL_TOKEN, platform cookies
+
+name: "Scan Community"
+
+on:
+  schedule:
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target platform code"
+        required: false
+        default: "xhs"
+        type: string
+      keywords:
+        description: "Comma-separated search terms"
+        required: false
+        default: "auto"
+        type: string
+      max_notes:
+        description: "Max posts per keyword"
+        required: false
+        default: "20"
+        type: string
+      enable_warp:
+        description: "Enable tunnel"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        platform: [xhs, dy, bili, wb]
+      fail-fast: false
+
+    concurrency:
+      group: scan-community-${{ matrix.platform }}
+      cancel-in-progress: false
+
+    env:
+      GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
+      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+      BRIDGE_SOCIAL_TOKEN: ${{ secrets.BRIDGE_SOCIAL_TOKEN }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      MC_COOKIE_XHS: ${{ secrets.MC_COOKIE_XHS }}
+      MC_COOKIE_DY: ${{ secrets.MC_COOKIE_DY }}
+      MC_COOKIE_BILI: ${{ secrets.MC_COOKIE_BILI }}
+      MC_COOKIE_WB: ${{ secrets.MC_COOKIE_WB }}
+      MC_COOKIE_KS: ${{ secrets.MC_COOKIE_KS }}
+      MC_COOKIE_ZHIHU: ${{ secrets.MC_COOKIE_ZHIHU }}
+      MC_COOKIE_TIEBA: ${{ secrets.MC_COOKIE_TIEBA }}
+      WARP_PRIVATE_KEY: ${{ secrets.WARP_PRIVATE_KEY }}
+      WARP_PEER_PUBLIC_KEY: ${{ secrets.WARP_PEER_PUBLIC_KEY }}
+      WARP_CLIENT_IPV4: ${{ secrets.WARP_CLIENT_IPV4 }}
+      WARP_CLIENT_IPV6: ${{ secrets.WARP_CLIENT_IPV6 }}
+      PROXY_URL: ${{ secrets.PROXY_URL }}
+      PLATFORM: ${{ matrix.platform }}
+      BATCH_ID: ${{ github.run_id }}
+      MC_MAX_NOTES: ${{ inputs.max_notes || '20' }}
+
+    steps:
+      # ── 0. WARP Ghost Ingress ────────────────────────────────────────
+      - name: Net bootstrap
+        id: warp
+        if: ${{ inputs.enable_warp != false }}
+        continue-on-error: true
+        run: |
+          W_OK="false"
+          D_REASON=""
+
+          WGCF_VERSION="2.2.22"
+          WGCF_SHA256="d70a9d633590114a00eefd1f1e75f45aab1f4a0e73558f1e5a20e85c60acdc73"
+          WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64"
+
+          if curl -sL -o /tmp/wgcf "$WGCF_URL" --max-time 15 --connect-timeout 10; then
+            ACTUAL_SHA=$(sha256sum /tmp/wgcf | cut -d' ' -f1)
+            if [ "$ACTUAL_SHA" = "$WGCF_SHA256" ]; then
+              chmod +x /tmp/wgcf
+              echo "[W] ok"
+            else
+              D_REASON="w:0x01"
+              echo "[W] 0x01"
+            fi
+          else
+            D_REASON="w:0x02"
+            echo "[W] 0x02"
+          fi
+
+          if [ -z "$D_REASON" ] && [ -x /tmp/wgcf ]; then
+            if /tmp/wgcf register --accept-tos 2>/dev/null; then
+              /tmp/wgcf generate 2>/dev/null
+
+              sudo timeout 30 apt-get install -y -qq wireguard-tools 2>/dev/null
+
+              if [ -f wgcf-profile.conf ]; then
+                sed -i '/^DNS/d' wgcf-profile.conf
+                echo "PostUp = ip rule add to 10.0.0.0/8 lookup main priority 100" >> wgcf-profile.conf
+                echo "PostUp = ip rule add to 172.16.0.0/12 lookup main priority 100" >> wgcf-profile.conf
+                echo "PostUp = ip rule add to 192.168.0.0/16 lookup main priority 100" >> wgcf-profile.conf
+
+                sudo cp wgcf-profile.conf /etc/wireguard/wgcf.conf
+                if sudo timeout 30 wg-quick up wgcf 2>/dev/null; then
+                  echo "[W] ok"
+                  W_OK="true"
+                else
+                  D_REASON="w:0x03"
+                  echo "[W] 0x03"
+                fi
+              else
+                D_REASON="w:0x04"
+              fi
+              rm -f wgcf-account.toml wgcf-profile.conf
+            else
+              D_REASON="w:0x05"
+              echo "[W] 0x05"
+            fi
+          fi
+
+          echo "warp_ok=$W_OK" >> "$GITHUB_OUTPUT"
+          echo "degrade_reason=$D_REASON" >> "$GITHUB_OUTPUT"
+
+          if [ "$W_OK" = "false" ] && [ -n "$D_REASON" ]; then
+            echo "[W] degraded=$D_REASON"
+          fi
+
+      # ── 1. Runtime setup ─────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 2. System deps (Playwright/Chromium) ─────────────────────────
+      - name: Sys deps
+        run: |
+          sudo apt-get update -qq 2>/dev/null
+          sudo apt-get install -y -qq \
+            libx11-6 libxrandr2 libxdamage1 libxrender1 \
+            libxext6 libxkbcommon0 libgbm1 libnss3 libatk1.0-0 \
+            libatk-bridge2.0-0 libcups2 libdrm2 libxcomposite1 \
+            libxfixes3 libpango-1.0-0 libcairo2 libasound2t64 2>/dev/null \
+          || sudo apt-get install -y -qq \
+            libx11-6 libxrandr2 libxdamage1 libxrender1 \
+            libxext6 libxkbcommon0 libgbm1 libnss3 libatk1.0-0 \
+            libatk-bridge2.0-0 libcups2 libdrm2 libxcomposite1 \
+            libxfixes3 libpango-1.0-0 libcairo2 libasound2 2>/dev/null
+          echo "[sys] ok"
+
+      # ── 3. Clone MediaCrawler (supply chain pinned) ──────────────────
+      - name: Fetch crawler
+        env:
+          MC_REPO: "https://github.com/NanmiCoder/MediaCrawler.git"
+          MC_PINNED_SHA: "71168a46f6b00289ca073a9e3e6a13c08e1f2599"
+        run: |
+          git init /tmp/MediaCrawler
+          cd /tmp/MediaCrawler
+          git fetch --depth 1 "$MC_REPO" "$MC_PINNED_SHA"
+          git checkout FETCH_HEAD
+          echo "[mc] pin=${MC_PINNED_SHA:0:8}"
+          pip install --quiet -r requirements.txt 2>/dev/null
+          playwright install chromium 2>/dev/null
+          echo "[mc] ok"
+
+      # ── 4. Inject cookie state ───────────────────────────────────────
+      - name: State inject
+        run: |
+          PLATFORM_DIR="/tmp/MediaCrawler/browser_data/$PLATFORM"
+          mkdir -p "$PLATFORM_DIR"
+          COOKIE_JSON=""
+
+          # Primary: pull from bridge API
+          if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+            HTTP_CODE=$(curl -s -o /tmp/_cs.json -w "%{http_code}" \
+              -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+              "$GHA_BASE_URL/api/internal/mc-cookies?platform=$PLATFORM" \
+              --max-time 10 || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              COOKIE_JSON=$(cat /tmp/_cs.json)
+              echo "[cs] src=api"
+            else
+              echo "[cs] api=$HTTP_CODE"
+            fi
+            rm -f /tmp/_cs.json
+          fi
+
+          # Fallback: GitHub Secrets
+          if [ -z "$COOKIE_JSON" ]; then
+            case "$PLATFORM" in
+              xhs)   COOKIE_JSON="$MC_COOKIE_XHS" ;;
+              dy)    COOKIE_JSON="$MC_COOKIE_DY" ;;
+              bili)  COOKIE_JSON="$MC_COOKIE_BILI" ;;
+              wb)    COOKIE_JSON="$MC_COOKIE_WB" ;;
+              ks)    COOKIE_JSON="$MC_COOKIE_KS" ;;
+              zhihu) COOKIE_JSON="$MC_COOKIE_ZHIHU" ;;
+              tieba) COOKIE_JSON="$MC_COOKIE_TIEBA" ;;
+            esac
+
+            if [ -n "$COOKIE_JSON" ]; then
+              echo "[cs] src=secret"
+            fi
+          fi
+
+          if [ -z "$COOKIE_JSON" ]; then
+            echo "[cs] 0x01"
+            # Report missing state to bridge
+            if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+              curl -sf -X POST \
+                "$GHA_BASE_URL/api/ingest/harvest-report" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+                -d "{\"platform\":\"$PLATFORM\",\"status\":\"needs_login\",\"run_id\":\"$GITHUB_RUN_ID\"}" \
+                --max-time 5 2>/dev/null || true
+            fi
+            exit 0
+          fi
+
+          echo "$COOKIE_JSON" > "$PLATFORM_DIR/state.json"
+          echo "[cs] ok"
+
+      # ── 5. Resolve keywords ──────────────────────────────────────────
+      - name: Resolve kw
+        id: kw
+        env:
+          INPUT_KEYWORDS: ${{ inputs.keywords || 'auto' }}
+        run: |
+          KEYWORDS="$INPUT_KEYWORDS"
+
+          if [ "$KEYWORDS" = "auto" ] && [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+            RESP=$(curl -sf \
+              "$GHA_BASE_URL/api/v1/signal?limit=15&lang=zh" \
+              -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+              --max-time 10 2>/dev/null || echo "")
+            if [ -n "$RESP" ]; then
+              AUTO_KW=$(echo "$RESP" | jq -r '.data[].noun // empty' 2>/dev/null | head -10 | paste -sd, -)
+            fi
+            if [ -n "$AUTO_KW" ]; then
+              echo "keywords=$AUTO_KW" >> "$GITHUB_OUTPUT"
+              KW_COUNT=$(echo "$AUTO_KW" | tr ',' '\n' | wc -l | tr -d ' ')
+              echo "[kw] src=api n=$KW_COUNT"
+            else
+              echo "keywords=AI agent,大模型,开源AI,ChatGPT,创业,融资,出海" >> "$GITHUB_OUTPUT"
+              echo "[kw] src=default"
+            fi
+          else
+            echo "keywords=$KEYWORDS" >> "$GITHUB_OUTPUT"
+            KW_COUNT=$(echo "$KEYWORDS" | tr ',' '\n' | wc -l | tr -d ' ')
+            echo "[kw] src=input n=$KW_COUNT"
+          fi
+
+      # ── 6. Configure keywords + proxy ────────────────────────────────
+      - name: Configure
+        env:
+          RESOLVED_KW: ${{ steps.kw.outputs.keywords }}
+        run: |
+          cd /tmp/MediaCrawler
+          python3 -c "
+          import re, os
+          config_path = 'config/base_config.py'
+          with open(config_path, 'r') as f:
+              content = f.read()
+          keywords = os.environ.get('RESOLVED_KW', 'AI agent')
+          max_notes = os.environ.get('MC_MAX_NOTES', '20')
+          content = re.sub(
+              r'KEYWORDS\s*=\s*\"[^\"]*\"',
+              f'KEYWORDS = \"{keywords}\"',
+              content
+          )
+          content = re.sub(
+              r'CRAWLER_MAX_NOTES_COUNT\s*=\s*\d+',
+              f'CRAWLER_MAX_NOTES_COUNT = {max_notes}',
+              content
+          )
+          content = re.sub(
+              r'HEADLESS\s*=\s*\w+',
+              'HEADLESS = True',
+              content
+          )
+          content = re.sub(
+              r'ENABLE_CDP_MODE\s*=\s*\w+',
+              'ENABLE_CDP_MODE = False',
+              content
+          )
+          content = re.sub(
+              r'SAVE_DATA_OPTION\s*=\s*\"[^\"]*\"',
+              'SAVE_DATA_OPTION = \"json\"',
+              content
+          )
+          proxy_url = os.environ.get('PROXY_URL', '')
+          if proxy_url:
+              content = re.sub(
+                  r'ENABLE_IP_PROXY\s*=\s*\w+',
+                  'ENABLE_IP_PROXY = True',
+                  content
+              )
+          with open(config_path, 'w') as f:
+              f.write(content)
+          print('[cfg] ok')
+          "
+
+      # ── 7. Stealth jitter ───────────────────────────────────────────
+      - name: Jitter
+        run: |
+          J=$((RANDOM % 180))
+          echo "[j] ${J}s"
+          sleep $J
+
+      # ── 8. Run MediaCrawler ──────────────────────────────────────────
+      - name: Crawl
+        id: crawl
+        working-directory: /tmp/MediaCrawler
+        env:
+          HTTP_PROXY: ${{ env.PROXY_URL }}
+          HTTPS_PROXY: ${{ env.PROXY_URL }}
+          RESOLVED_KEYWORDS: ${{ steps.kw.outputs.keywords }}
+        run: |
+          EXIT_CODE=0
+          timeout 1800 python main.py \
+            --platform "$PLATFORM" --lt cookie --type search \
+            > /dev/null 2>&1 || EXIT_CODE=$?
+
+          # Detect auth failures silently
+          LOGIN_FAIL="false"
+          if [ -f /tmp/MediaCrawler/data/*.log ] 2>/dev/null; then
+            if grep -qriE "login|扫码|二维码|qr.?code|expired.?session|need.*auth|401|403" \
+              /tmp/MediaCrawler/data/ 2>/dev/null; then
+              LOGIN_FAIL="true"
+            fi
+          fi
+
+          if [ "$LOGIN_FAIL" = "true" ]; then
+            echo "[crawl] 0x01"
+            if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+              curl -sf -X POST \
+                "$GHA_BASE_URL/api/ingest/harvest-report" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+                -d "{\"platform\":\"$PLATFORM\",\"status\":\"needs_login\",\"run_id\":\"$GITHUB_RUN_ID\"}" \
+                --max-time 5 2>/dev/null || true
+            fi
+            echo "crawl_ok=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EXIT_CODE" -ne 0 ]; then
+            echo "[crawl] 0x02 rc=$EXIT_CODE"
+            echo "crawl_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            ITEM_COUNT=$(find data/ -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+            echo "[crawl] ok files=$ITEM_COUNT"
+            echo "crawl_ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 9. Parse + Push results (inline Node.js) ─────────────────────
+      - name: Push results
+        if: steps.crawl.outputs.crawl_ok == 'true'
+        env:
+          MC_OUTPUT_DIR: /tmp/MediaCrawler/data
+        run: |
+          node --experimental-fetch << 'PUSH_EOF'
+          const fs = require('fs');
+          const path = require('path');
+
+          const GHA_BASE_URL = process.env.GHA_BASE_URL;
+          const BRIDGE_SOCIAL_TOKEN = process.env.BRIDGE_SOCIAL_TOKEN;
+          const PLATFORM = process.env.PLATFORM;
+          const BATCH_ID = process.env.BATCH_ID || String(Date.now());
+          const MC_OUTPUT_DIR = process.env.MC_OUTPUT_DIR || '/tmp/MediaCrawler/data';
+
+          // Platform code → full name mapping
+          const PLATFORM_MAP = {
+            xhs:  'xiaohongshu',
+            dy:   'douyin',
+            bili: 'bilibili',
+            wb:   'weibo',
+            ks:   'kuaishou',
+            zhihu:'zhihu',
+            tieba:'tieba'
+          };
+
+          function toEpochMs(v) {
+            if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+            if (typeof v === 'string' && v.trim()) {
+              const n = Number(v);
+              if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+              const p = Date.parse(v);
+              return Number.isNaN(p) ? null : p;
+            }
+            return null;
+          }
+
+          function toIso(v) {
+            const ms = toEpochMs(v);
+            return ms == null ? undefined : new Date(ms).toISOString();
+          }
+
+          function authorName(v) {
+            return typeof v === 'string' ? v : (v && v.name ? v.name : undefined);
+          }
+
+          function normalize(raw, mcType) {
+            switch (mcType) {
+              case 'xhs': {
+                const id = raw.note_id || raw.id;
+                if (!id) return null;
+                const pub = toEpochMs(raw.time) || toEpochMs(raw.create_time) || Date.now();
+                return {
+                  platform: 'xiaohongshu',
+                  url: `https://www.xiaohongshu.com/explore/${id}`,
+                  title: raw.title || (raw.desc || '').slice(0, 100) || '',
+                  content: (raw.desc || raw.content || '').slice(0, 2000),
+                  author: (raw.user && raw.user.nickname) || raw.nickname || raw.user_name,
+                  published_at: new Date(pub).toISOString(),
+                  metrics: { likes: raw.liked_count, comments: raw.comment_count, collected: raw.collected_count },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'dy': {
+                const id = raw.aweme_id || raw.id;
+                if (!id) return null;
+                const pub = toEpochMs(raw.create_time) || Date.now();
+                return {
+                  platform: 'douyin',
+                  url: `https://www.douyin.com/video/${id}`,
+                  title: (raw.desc || '').slice(0, 100) || '',
+                  content: (raw.desc || '').slice(0, 2000),
+                  author: raw.nickname || authorName(raw.author),
+                  published_at: new Date(pub).toISOString(),
+                  metrics: { likes: raw.digg_count, comments: raw.comment_count, shares: raw.share_count },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'bili': {
+                const bvid = raw.bvid || raw.id;
+                if (!bvid) return null;
+                const pub = toEpochMs(raw.pubdate) || toEpochMs(raw.ctime) || Date.now();
+                return {
+                  platform: 'bilibili',
+                  url: `https://www.bilibili.com/video/${bvid}`,
+                  title: raw.title || '',
+                  content: (raw.desc || raw.description || '').slice(0, 2000),
+                  author: (raw.owner && raw.owner.name) || authorName(raw.author),
+                  published_at: new Date(pub).toISOString(),
+                  metrics: { views: raw.view, likes: raw.like, comments: raw.reply, danmaku: raw.danmaku },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'wb': {
+                const id = raw.id || raw.mid;
+                if (!id) return null;
+                const uid = (raw.user && raw.user.id) || 'u';
+                return {
+                  platform: 'weibo',
+                  url: `https://weibo.com/${uid}/${id}`,
+                  title: (raw.text_raw || raw.text || '').slice(0, 100),
+                  content: (raw.text_raw || raw.text || '').slice(0, 2000),
+                  author: (raw.user && raw.user.screen_name) || raw.screen_name,
+                  published_at: toIso(raw.created_at),
+                  metrics: { likes: raw.attitudes_count, comments: raw.comments_count, reposts: raw.reposts_count },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'ks': {
+                const id = raw.photo_id || raw.id;
+                if (!id) return null;
+                return {
+                  platform: 'kuaishou',
+                  url: `https://www.kuaishou.com/short-video/${id}`,
+                  title: (raw.caption || raw.desc || '').slice(0, 100) || '',
+                  content: (raw.caption || raw.desc || '').slice(0, 2000),
+                  author: raw.user_name || authorName(raw.author),
+                  published_at: toIso(raw.timestamp),
+                  metrics: { likes: raw.like_count, views: raw.view_count },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'zhihu': {
+                const id = raw.id || raw.question_id;
+                if (!id) return null;
+                return {
+                  platform: 'zhihu',
+                  url: raw.url || `https://www.zhihu.com/question/${id}`,
+                  title: raw.title || (raw.content || '').slice(0, 100) || '',
+                  content: (raw.content || raw.excerpt || '').slice(0, 2000),
+                  author: authorName(raw.author) || raw.author_name,
+                  published_at: toIso(raw.created),
+                  metrics: { upvotes: raw.voteup_count, comments: raw.comment_count },
+                  batch_id: BATCH_ID
+                };
+              }
+              case 'tieba': {
+                const id = raw.id || raw.tid;
+                if (!id) return null;
+                return {
+                  platform: 'tieba',
+                  url: `https://tieba.baidu.com/p/${id}`,
+                  title: raw.title || (raw.content || '').slice(0, 100) || '',
+                  content: (raw.content || '').slice(0, 2000),
+                  author: raw.author_name || authorName(raw.author),
+                  published_at: toIso(raw.create_time),
+                  metrics: { replies: raw.reply_num },
+                  batch_id: BATCH_ID
+                };
+              }
+              default:
+                return null;
+            }
+          }
+
+          function scanDir(dir) {
+            const results = [];
+            if (!fs.existsSync(dir)) return results;
+            const entries = fs.readdirSync(dir, { recursive: true }).map(String);
+            const jsonFiles = entries.filter(f => f.endsWith('.json') || f.endsWith('.jsonl'));
+            for (const file of jsonFiles) {
+              try {
+                const raw = fs.readFileSync(path.join(dir, file), 'utf-8');
+                const lines = raw.includes('\n') ? raw.trim().split('\n') : [raw];
+                for (const line of lines) {
+                  if (!line.trim()) continue;
+                  try {
+                    const obj = JSON.parse(line);
+                    // Handle arrays (some MC outputs wrap items in an array)
+                    if (Array.isArray(obj)) {
+                      for (const item of obj) {
+                        const n = normalize(item, PLATFORM);
+                        if (n) results.push(n);
+                      }
+                    } else {
+                      const n = normalize(obj, PLATFORM);
+                      if (n) results.push(n);
+                    }
+                  } catch {}
+                }
+              } catch {}
+            }
+            return results;
+          }
+
+          async function push(items) {
+            const BATCH_SIZE = 100;
+            let total = 0;
+            for (let i = 0; i < items.length; i += BATCH_SIZE) {
+              const batch = items.slice(i, i + BATCH_SIZE);
+              try {
+                const res = await fetch(`${GHA_BASE_URL}/api/bridge/push`, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${BRIDGE_SOCIAL_TOKEN}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({ items: batch, type: 'social' })
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  total += (data.inserted || batch.length);
+                }
+              } catch {}
+            }
+            return total;
+          }
+
+          async function main() {
+            if (!GHA_BASE_URL || !BRIDGE_SOCIAL_TOKEN) {
+              console.log('[push] 0x01');
+              process.exit(1);
+            }
+
+            const items = scanDir(MC_OUTPUT_DIR);
+
+            // Deduplicate by URL
+            const seen = new Set();
+            const unique = items.filter(item => {
+              if (seen.has(item.url)) return false;
+              seen.add(item.url);
+              return true;
+            });
+
+            if (unique.length === 0) {
+              console.log('[push] n=0');
+              process.exit(0);
+            }
+
+            const inserted = await push(unique);
+            console.log(`[push] ok n=${inserted}`);
+          }
+
+          main().catch(() => {
+            console.log('[push] 0x02');
+            process.exit(1);
+          });
+          PUSH_EOF
+
+      # ── 10. Trigger pipeline ─────────────────────────────────────────
+      - name: Trigger
+        if: steps.crawl.outputs.crawl_ok == 'true'
+        run: |
+          curl -sf -X POST \
+            "$GHA_BASE_URL/api/v1/pipeline" \
+            -H "Authorization: Bearer $BRIDGE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}' --max-time 15 2>/dev/null \
+            && echo "[t] ok" || echo "[t] 0x01"
+
+      # ── 11. Heartbeat ────────────────────────────────────────────────
+      - name: Ping
+        if: always()
+        env:
+          WARP_DEGRADE: ${{ steps.warp.outputs.degrade_reason }}
+          WARP_ACTIVE: ${{ steps.warp.outputs.warp_ok }}
+        run: |
+          DL=0
+          if [ -n "$WARP_DEGRADE" ]; then DL=1; fi
+
+          curl -sf "$GHA_BASE_URL/api/heartbeat" \
+            -H "Authorization: Bearer $BRIDGE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"source\":\"gha-scan-community\",\"platform\":\"${PLATFORM}\",\"status\":\"${{ job.status }}\",\"degrade_level\":${DL},\"degrade_reason_code\":\"${WARP_DEGRADE}\",\"warp_active\":\"${WARP_ACTIVE}\"}" \
+            --max-time 10 2>/dev/null || true
+          echo "[hb] ok"
+
+      # ── 12. WARP teardown ────────────────────────────────────────────
+      - name: Net cleanup
+        if: always() && steps.warp.outputs.warp_ok == 'true'
+        run: |
+          sudo wg-quick down wgcf 2>/dev/null || true
+          echo "[W] down"
+
+      # ── 13. Job summary ──────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          ITEM_COUNT=$(find /tmp/MediaCrawler/data/ -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+          echo "## Community Scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Items | ${ITEM_COUNT} |" >> "$GITHUB_STEP_SUMMARY"

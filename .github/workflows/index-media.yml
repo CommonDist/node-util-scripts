@@ -1,0 +1,269 @@
+# Generic media indexer — no project-specific references
+name: Index Media
+
+on:
+  schedule:
+    - cron: '30 6,18 * * *'
+  workflow_dispatch:
+    inputs:
+      max_channels:
+        description: 'Maximum channels to process'
+        required: false
+        default: '15'
+      batch_id:
+        description: 'Override batch identifier'
+        required: false
+
+concurrency:
+  group: index-media
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
+      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      MAX_CHANNELS: ${{ inputs.max_channels || '15' }}
+      BATCH_ID: ${{ inputs.batch_id || github.run_id }}
+
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp
+        run: pip install --quiet yt-dlp
+
+      - name: Run indexer
+        id: indexer
+        run: |
+          node - <<'SCRIPT'
+          const { execFile } = require('child_process');
+          const { promisify } = require('util');
+          const { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } = require('fs');
+          const exec = promisify(execFile);
+
+          const BASE = (process.env.GHA_BASE_URL || '').replace(/\/+$/, '');
+          const TOKEN = process.env.BRIDGE_TOKEN || '';
+          const GROQ_KEY = process.env.GROQ_API_KEY || '';
+          const MAX_CH = Math.min(Number(process.env.MAX_CHANNELS || '15'), 30);
+          const BATCH = process.env.BATCH_ID || `m-${Date.now()}`;
+          const TEMP = '/tmp/media-idx';
+          const SUMMARY_FILE = process.env.GITHUB_STEP_SUMMARY || '/dev/null';
+
+          if (!BASE || !TOKEN) { console.log('[E] 0x00'); process.exit(1); }
+
+          mkdirSync(TEMP, { recursive: true });
+
+          async function api(method, path, body) {
+            const opts = {
+              method,
+              headers: {
+                'Authorization': `Bearer ${TOKEN}`,
+                'Content-Type': 'application/json',
+              },
+            };
+            if (body) opts.body = JSON.stringify(body);
+            const r = await fetch(`${BASE}${path}`, opts);
+            if (!r.ok) throw new Error(`0x${r.status.toString(16)}`);
+            return method === 'GET' ? r.json() : undefined;
+          }
+
+          async function ytdlp(args) {
+            try {
+              const { stdout } = await exec('yt-dlp', args, {
+                maxBuffer: 10 * 1024 * 1024,
+                timeout: 120000,
+              });
+              return stdout;
+            } catch { return ''; }
+          }
+
+          async function getRecentVideos(handle, maxItems = 5) {
+            const url = `https://www.youtube.com/${handle}/videos`;
+            const out = await ytdlp([
+              '--flat-playlist', '--dump-json', '--no-warnings', '--quiet',
+              '--playlist-items', `1-${maxItems}`,
+              '--extractor-args', 'youtube:lang=en',
+              url,
+            ]);
+            return out.trim().split('\n').filter(Boolean).map(line => {
+              try { return JSON.parse(line); } catch { return null; }
+            }).filter(Boolean);
+          }
+
+          async function getSubtitles(videoId) {
+            const outFile = `${TEMP}/${videoId}`;
+            await ytdlp([
+              '--write-auto-sub', '--sub-lang', 'en,zh-Hans', '--skip-download',
+              '--output', outFile, '--no-warnings', '--quiet',
+              `https://www.youtube.com/watch?v=${videoId}`,
+            ]);
+
+            for (const lang of ['en', 'zh-Hans']) {
+              for (const ext of ['vtt', 'srt']) {
+                const p = `${outFile}.${lang}.${ext}`;
+                if (existsSync(p)) {
+                  const raw = readFileSync(p, 'utf-8');
+                  return raw
+                    .replace(/\d{2}:\d{2}[\d:.→\->]+\n?/g, '')
+                    .replace(/<[^>]+>/g, '')
+                    .replace(/\n{2,}/g, '\n')
+                    .trim()
+                    .slice(0, 15000);
+                }
+              }
+            }
+            return '';
+          }
+
+          async function summarize(text) {
+            if (!GROQ_KEY || !text || text.length < 200) return '';
+            try {
+              const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${GROQ_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  model: 'llama-3.1-8b-instant',
+                  messages: [
+                    {
+                      role: 'system',
+                      content: 'Summarize the following video transcript in 2-3 concise paragraphs. Focus on key points, claims, and insights. Respond in the same language as the transcript.',
+                    },
+                    { role: 'user', content: text.slice(0, 8000) },
+                  ],
+                  max_tokens: 500,
+                  temperature: 0.3,
+                }),
+                signal: AbortSignal.timeout(30000),
+              });
+              const data = await r.json();
+              return data.choices?.[0]?.message?.content || '';
+            } catch { return ''; }
+          }
+
+          async function run() {
+            const t0 = Date.now();
+
+            let channels;
+            try {
+              const resp = await api('GET', `/api/bridge/tasks?type=video&limit=${MAX_CH}`);
+              channels = resp.channels || [];
+            } catch {
+              console.log('[E] 0x01');
+              process.exit(1);
+            }
+
+            if (!channels.length) {
+              console.log('[idx] ch=0');
+              process.exit(0);
+            }
+
+            let totalVid = 0, totalSub = 0, totalSum = 0;
+            const items = [];
+
+            for (const ch of channels) {
+              try {
+                const videos = await getRecentVideos(ch.handle, 5);
+                for (const v of videos) {
+                  totalVid++;
+                  const videoId = v.id || v.display_id;
+                  if (!videoId) continue;
+
+                  let subtitle = '';
+                  try {
+                    subtitle = await getSubtitles(videoId);
+                    totalSub += subtitle ? 1 : 0;
+                  } catch {}
+
+                  let summary = '';
+                  if (subtitle) {
+                    try {
+                      summary = await summarize(subtitle);
+                      totalSum += summary ? 1 : 0;
+                    } catch {}
+                  }
+
+                  items.push({
+                    platform: 'youtube',
+                    url: `https://www.youtube.com/watch?v=${videoId}`,
+                    title: String(v.title || '').slice(0, 500),
+                    content: summary || subtitle.slice(0, 2000) || String(v.description || '').slice(0, 2000),
+                    author: ch.handle,
+                    vertical: ch.vertical || '',
+                    lang: ch.lang || 'en',
+                    published_at: v.upload_date
+                      ? new Date(v.upload_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')).toISOString()
+                      : new Date().toISOString(),
+                    view_count: v.view_count || 0,
+                    duration: v.duration || 0,
+                    batch_id: BATCH,
+                    fetched_at: new Date().toISOString(),
+                  });
+                }
+              } catch {}
+
+              await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+            }
+
+            // Push in batches of 100
+            for (let i = 0; i < items.length; i += 100) {
+              try {
+                await api('POST', '/api/bridge/push', {
+                  items: items.slice(i, i + 100),
+                  type: 'video',
+                });
+              } catch {
+                console.log('[E] 0x03');
+              }
+            }
+
+            const ms = Date.now() - t0;
+
+            await api('POST', '/api/bridge/report', {
+              source: 'media-index',
+              pipeline: 'video',
+              channels_total: channels.length,
+              videos_total: totalVid,
+              subtitles: totalSub,
+              summaries: totalSum,
+              new_records: items.length,
+              duration_ms: ms,
+              run_id: BATCH,
+            }).catch(() => {});
+
+            await api('POST', '/api/bridge/heartbeat', {
+              source: 'media-index',
+              status: 'ok',
+            }).catch(() => {});
+
+            console.log(`[idx] ch=${channels.length} vid=${totalVid} sub=${totalSub} sum=${totalSum} ms=${ms}`);
+
+            // Write job summary
+            const summary = [
+              '## Media Index',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Channels | ${channels.length} |`,
+              `| Videos | ${totalVid} |`,
+              `| Subtitles | ${totalSub} |`,
+              `| Summaries | ${totalSum} |`,
+              `| Duration | ${(ms / 1000).toFixed(1)}s |`,
+            ].join('\n');
+            appendFileSync(SUMMARY_FILE, summary + '\n');
+          }
+
+          run().catch(() => { console.log('[E] 0x0F'); process.exit(1); });
+          SCRIPT
