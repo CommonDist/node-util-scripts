@@ -265,5 +265,5 @@ jobs:
             appendFileSync(SUMMARY_FILE, summary + '\n');
           }
 
-          run().catch(() => { console.log('[E] 0x0F'); process.exit(1); });
+          run().catch(e => { console.log(`[E] 0x0F ${e.message?.slice(0,80)}`); process.exit(1); });
           SCRIPT

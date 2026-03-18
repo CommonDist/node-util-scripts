@@ -45,7 +45,7 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install --no-save rss-parser p-limit
+        run: npm install --no-save rss-parser p-limit@4
 
       - name: Harvest feeds
         id: harvest
@@ -185,5 +185,5 @@ jobs:
             }
           }
 
-          run().catch(() => { console.log('[E] 0x0F'); process.exit(1); });
+          run().catch(e => { console.log(`[E] 0x0F ${e.message?.slice(0,80)}`); process.exit(1); });
           SCRIPT
