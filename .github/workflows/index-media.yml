@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 25
     env:
       GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
-      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+      WORKER_SYNC_SECRET: ${{ secrets.WORKER_SYNC_SECRET }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       MAX_CHANNELS: ${{ inputs.max_channels || '15' }}
       BATCH_ID: ${{ inputs.batch_id || github.run_id }}
@@ -53,7 +53,7 @@ jobs:
           const exec = promisify(execFile);
 
           const BASE = (process.env.GHA_BASE_URL || '').replace(/\/+$/, '');
-          const TOKEN = process.env.BRIDGE_TOKEN || '';
+          const TOKEN = process.env.WORKER_SYNC_SECRET || '';
           const GROQ_KEY = process.env.GROQ_API_KEY || '';
           const MAX_CH = Math.min(Number(process.env.MAX_CHANNELS || '15'), 30);
           const BATCH = process.env.BATCH_ID || `m-${Date.now()}`;
@@ -74,7 +74,10 @@ jobs:
             };
             if (body) opts.body = JSON.stringify(body);
             const r = await fetch(`${BASE}${path}`, opts);
-            if (!r.ok) throw new Error(`0x${r.status.toString(16)}`);
+            if (!r.ok) {
+              const txt = await r.text().catch(() => '');
+              throw new Error(`HTTP ${r.status} ${method} ${path} ${txt.slice(0, 200)}`.trim());
+            }
             return method === 'GET' ? r.json() : undefined;
           }
 
@@ -161,8 +164,8 @@ jobs:
             try {
               const resp = await api('GET', `/api/bridge/tasks?type=video&limit=${MAX_CH}`);
               channels = resp.channels || [];
-            } catch {
-              console.log('[E] 0x01');
+            } catch (e) {
+              console.log(`[E] 0x01 ${String(e?.message || e).slice(0, 200)}`);
               process.exit(1);
             }
 
