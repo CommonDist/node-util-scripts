@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 20
     env:
       GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
-      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+      WORKER_SYNC_SECRET: ${{ secrets.WORKER_SYNC_SECRET }}
       BATCH_ID: ${{ inputs.batch_id || github.run_id }}
       FEED_LIMIT: ${{ inputs.limit || '90' }}
       FEED_CONCURRENCY: ${{ inputs.concurrency || '6' }}
@@ -57,7 +57,7 @@ jobs:
           const fs = require('fs');
 
           const BASE = (process.env.GHA_BASE_URL || '').replace(/\/+$/, '');
-          const TOKEN = process.env.BRIDGE_TOKEN || '';
+          const TOKEN = process.env.WORKER_SYNC_SECRET || '';
           const BATCH = process.env.BATCH_ID || `s-${Date.now()}`;
           const LIMIT = Math.min(Math.max(Number(process.env.FEED_LIMIT || '90'), 1), 200);
           const CONC = Math.min(Math.max(Number(process.env.FEED_CONCURRENCY || '6'), 1), 12);
@@ -84,13 +84,23 @@ jobs:
             };
             if (body) opts.body = JSON.stringify(body);
             const r = await fetch(`${BASE}${path}`, opts);
-            if (!r.ok) throw new Error(`0x${r.status.toString(16)}`);
+            if (!r.ok) {
+              const txt = await r.text().catch(() => '');
+              throw new Error(`HTTP ${r.status} ${method} ${path} ${txt.slice(0, 200)}`.trim());
+            }
             return method === 'GET' ? r.json() : undefined;
           }
 
           async function run() {
             const t0 = Date.now();
-            const { tasks } = await api('GET', `/api/bridge/tasks?limit=${LIMIT}`);
+            let tasks = [];
+            try {
+              const resp = await api('GET', `/api/bridge/tasks?limit=${LIMIT}`);
+              tasks = resp.tasks || [];
+            } catch (e) {
+              console.log(`[E] 0x01 ${String(e?.message || e).slice(0, 200)}`);
+              process.exit(1);
+            }
 
             const limit = pLimit(CONC);
             let ok = 0, err = 0;
