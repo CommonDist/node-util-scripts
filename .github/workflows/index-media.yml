@@ -153,6 +153,11 @@ jobs:
                 signal: AbortSignal.timeout(30000),
               });
               const data = await r.json();
+              if (data.usage) {
+                llmTokensIn += data.usage.prompt_tokens || 0;
+                llmTokensOut += data.usage.completion_tokens || 0;
+                llmCalls++;
+              }
               return data.choices?.[0]?.message?.content || '';
             } catch { return ''; }
           }
@@ -175,6 +180,7 @@ jobs:
             }
 
             let totalVid = 0, totalSub = 0, totalSum = 0;
+            let llmTokensIn = 0, llmTokensOut = 0, llmCalls = 0;
             const items = [];
 
             for (const ch of channels) {
@@ -246,6 +252,23 @@ jobs:
               duration_ms: ms,
               run_id: BATCH,
             }).catch(() => {});
+
+            // Report LLM usage to bridge
+            if (llmCalls > 0) {
+              await api('POST', '/api/bridge/llm-usage', {
+                reports: [{
+                  source: 'gha-commondist',
+                  workflow: 'index-media',
+                  provider: 'groq',
+                  model: 'llama-3.1-8b-instant',
+                  requests: llmCalls,
+                  inputTokens: llmTokensIn,
+                  outputTokens: llmTokensOut,
+                  durationMs: Date.now() - t0,
+                  runId: String(process.env.GITHUB_RUN_ID || ''),
+                }],
+              }).catch(() => {});
+            }
 
             await api('POST', '/api/bridge/heartbeat', {
               source: 'media-index',
