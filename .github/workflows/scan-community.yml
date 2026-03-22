@@ -1,5 +1,5 @@
 # Community content scanner — scheduled collection + analysis
-# Requires: GHA_BASE_URL, BRIDGE_TOKEN, BRIDGE_SOCIAL_TOKEN, platform cookies
+# Requires: GHA_BASE_URL, WORKER_SYNC_SECRET, SOCIAL_INGEST_SECRET, platform cookies
 
 name: "Scan Community"
 
@@ -44,8 +44,8 @@ jobs:
 
     env:
       GHA_BASE_URL: ${{ secrets.GHA_BASE_URL }}
-      BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
-      BRIDGE_SOCIAL_TOKEN: ${{ secrets.BRIDGE_SOCIAL_TOKEN }}
+      WORKER_SYNC_SECRET: ${{ secrets.WORKER_SYNC_SECRET }}
+      SOCIAL_INGEST_SECRET: ${{ secrets.SOCIAL_INGEST_SECRET }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       MC_COOKIE_XHS: ${{ secrets.MC_COOKIE_XHS }}
       MC_COOKIE_DY: ${{ secrets.MC_COOKIE_DY }}
@@ -176,10 +176,10 @@ jobs:
           COOKIE_JSON=""
 
           # Primary: pull from bridge API
-          if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+          if [ -n "$GHA_BASE_URL" ] && [ -n "$SOCIAL_INGEST_SECRET" ]; then
             HTTP_CODE=$(curl -s -o /tmp/_cs.json -w "%{http_code}" \
-              -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
-              "$GHA_BASE_URL/api/internal/mc-cookies?platform=$PLATFORM" \
+              -H "Authorization: Bearer $SOCIAL_INGEST_SECRET" \
+              "$GHA_BASE_URL/api/bridge/cookies?platform=$PLATFORM" \
               --max-time 10 || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
@@ -211,11 +211,11 @@ jobs:
           if [ -z "$COOKIE_JSON" ]; then
             echo "[cs] 0x01"
             # Report missing state to bridge
-            if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+            if [ -n "$GHA_BASE_URL" ] && [ -n "$WORKER_SYNC_SECRET" ]; then
               curl -sf -X POST \
-                "$GHA_BASE_URL/api/ingest/harvest-report" \
+                "$GHA_BASE_URL/api/bridge/report" \
                 -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+                -H "Authorization: Bearer $WORKER_SYNC_SECRET" \
                 -d "{\"platform\":\"$PLATFORM\",\"status\":\"needs_login\",\"run_id\":\"$GITHUB_RUN_ID\"}" \
                 --max-time 5 2>/dev/null || true
             fi
@@ -233,10 +233,10 @@ jobs:
         run: |
           KEYWORDS="$INPUT_KEYWORDS"
 
-          if [ "$KEYWORDS" = "auto" ] && [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+          if [ "$KEYWORDS" = "auto" ] && [ -n "$GHA_BASE_URL" ] && [ -n "$WORKER_SYNC_SECRET" ]; then
             RESP=$(curl -sf \
-              "$GHA_BASE_URL/api/v1/signal?limit=15&lang=zh" \
-              -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+              "$GHA_BASE_URL/api/bridge/trends?limit=15&lang=zh" \
+              -H "Authorization: Bearer $WORKER_SYNC_SECRET" \
               --max-time 10 2>/dev/null || echo "")
             if [ -n "$RESP" ]; then
               AUTO_KW=$(echo "$RESP" | jq -r '.data[].noun // empty' 2>/dev/null | head -10 | paste -sd, -)
@@ -337,11 +337,11 @@ jobs:
 
           if [ "$LOGIN_FAIL" = "true" ]; then
             echo "[crawl] 0x01"
-            if [ -n "$GHA_BASE_URL" ] && [ -n "$BRIDGE_SOCIAL_TOKEN" ]; then
+            if [ -n "$GHA_BASE_URL" ] && [ -n "$WORKER_SYNC_SECRET" ]; then
               curl -sf -X POST \
-                "$GHA_BASE_URL/api/ingest/harvest-report" \
+                "$GHA_BASE_URL/api/bridge/report" \
                 -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $BRIDGE_SOCIAL_TOKEN" \
+                -H "Authorization: Bearer $WORKER_SYNC_SECRET" \
                 -d "{\"platform\":\"$PLATFORM\",\"status\":\"needs_login\",\"run_id\":\"$GITHUB_RUN_ID\"}" \
                 --max-time 5 2>/dev/null || true
             fi
@@ -366,7 +366,7 @@ jobs:
           const path = require('path');
 
           const GHA_BASE_URL = process.env.GHA_BASE_URL;
-          const BRIDGE_SOCIAL_TOKEN = process.env.BRIDGE_SOCIAL_TOKEN;
+          const SOCIAL_INGEST_SECRET = process.env.SOCIAL_INGEST_SECRET;
           const PLATFORM = process.env.PLATFORM;
           const BATCH_ID = process.env.BATCH_ID || String(Date.now());
           const MC_OUTPUT_DIR = process.env.MC_OUTPUT_DIR || '/tmp/MediaCrawler/data';
@@ -550,7 +550,7 @@ jobs:
                 const res = await fetch(`${GHA_BASE_URL}/api/bridge/push`, {
                   method: 'POST',
                   headers: {
-                    'Authorization': `Bearer ${BRIDGE_SOCIAL_TOKEN}`,
+                    'Authorization': `Bearer ${SOCIAL_INGEST_SECRET}`,
                     'Content-Type': 'application/json'
                   },
                   body: JSON.stringify({ items: batch, type: 'social' })
@@ -565,7 +565,7 @@ jobs:
           }
 
           async function main() {
-            if (!GHA_BASE_URL || !BRIDGE_SOCIAL_TOKEN) {
+            if (!GHA_BASE_URL || !SOCIAL_INGEST_SECRET) {
               console.log('[push] 0x01');
               process.exit(1);
             }
@@ -600,8 +600,8 @@ jobs:
         if: steps.crawl.outputs.crawl_ok == 'true'
         run: |
           curl -sf -X POST \
-            "$GHA_BASE_URL/api/v1/pipeline" \
-            -H "Authorization: Bearer $BRIDGE_TOKEN" \
+            "$GHA_BASE_URL/api/bridge/signal" \
+            -H "Authorization: Bearer $WORKER_SYNC_SECRET" \
             -H "Content-Type: application/json" \
             -d '{}' --max-time 15 2>/dev/null \
             && echo "[t] ok" || echo "[t] 0x01"
@@ -616,8 +616,8 @@ jobs:
           DL=0
           if [ -n "$WARP_DEGRADE" ]; then DL=1; fi
 
-          curl -sf "$GHA_BASE_URL/api/heartbeat" \
-            -H "Authorization: Bearer $BRIDGE_TOKEN" \
+          curl -sf "$GHA_BASE_URL/api/bridge/heartbeat" \
+            -H "Authorization: Bearer $WORKER_SYNC_SECRET" \
             -H "Content-Type: application/json" \
             -d "{\"source\":\"gha-scan-community\",\"platform\":\"${PLATFORM}\",\"status\":\"${{ job.status }}\",\"degrade_level\":${DL},\"degrade_reason_code\":\"${WARP_DEGRADE}\",\"warp_active\":\"${WARP_ACTIVE}\"}" \
             --max-time 10 2>/dev/null || true
