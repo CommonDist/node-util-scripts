@@ -104,6 +104,7 @@ jobs:
 
             const limit = pLimit(CONC);
             let ok = 0, err = 0;
+            const okIds = [], errIds = [];
             const articles = [];
 
             await Promise.all(tasks.map(task => limit(async () => {
@@ -115,7 +116,7 @@ jobs:
                   },
                   signal: AbortSignal.timeout(10000),
                 });
-                if (!res.ok) { err++; return; }
+                if (!res.ok) { err++; errIds.push(task.sourceId); return; }
                 const xml = await res.text();
                 const feed = await parser.parseString(xml);
                 const now = new Date().toISOString();
@@ -142,7 +143,8 @@ jobs:
                   });
                 }
                 ok++;
-              } catch { err++; }
+                okIds.push(task.sourceId);
+              } catch { err++; errIds.push(task.sourceId); }
             })));
 
             // Push in batches
@@ -160,6 +162,8 @@ jobs:
               total_sources: tasks.length,
               sources_ok: ok,
               sources_error: err,
+              ok_source_ids: okIds,
+              error_source_ids: errIds,
               new_records: articles.length,
               duration_ms: ms,
               run_id: BATCH,

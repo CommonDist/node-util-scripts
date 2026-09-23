@@ -37,13 +37,7 @@ jobs:
         id: scan
         run: |
           node - <<'SCRIPT'
-          const INSTANCES = [
-            'https://search.sapti.me',
-            'https://searxng.site',
-            'https://priv.au',
-            'https://searx.tiekoetter.com',
-            'https://search.bus-hit.me',
-          ];
+
 
           const BASE = (process.env.GHA_BASE_URL || '').replace(/\/+$/, '');
           const TOKEN = process.env.WORKER_SYNC_SECRET || '';
@@ -89,17 +83,8 @@ jobs:
             } catch { return 'web'; }
           }
 
-          async function searchInstance(instance, query) {
-            const url = `${instance}/search?q=${encodeURIComponent(query)}&format=json&engines=google,duckduckgo,brave,bing&pageno=1`;
-            const r = await fetch(url, {
-              headers: {
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (compatible; WebScan/1.0)',
-              },
-              signal: AbortSignal.timeout(12000),
-            });
-            if (!r.ok) throw new Error('search failed');
-            return r.json();
+          async function search(query) {
+            return api('GET', `/api/bridge/search?q=${encodeURIComponent(query)}`);
           }
 
           async function run() {
@@ -116,33 +101,27 @@ jobs:
             let okQ = 0, errQ = 0, items = [];
 
             for (const noun of nouns) {
-              let found = false;
-              for (const inst of INSTANCES) {
-                try {
-                  const data = await searchInstance(inst, noun);
-                  const results = data.results || [];
-                  for (const r of results.slice(0, 15)) {
-                    const url = String(r.url || '').trim();
-                    const title = String(r.title || '').trim();
-                    if (!url || !title) continue;
-                    items.push({
-                      url,
-                      title: title.slice(0, 500),
-                      content: String(r.content || '').slice(0, 2000),
-                      platform: classifyUrl(url),
-                      noun,
-                      batch_id: BATCH,
-                      searched_at: new Date().toISOString(),
-                    });
-                  }
-                  found = true;
-                  okQ++;
-                  break;
-                } catch {
-                  continue;
+              try {
+                const data = await search(noun);
+                const results = data.results || [];
+                for (const r of results.slice(0, 15)) {
+                  const url = String(r.url || '').trim();
+                  const title = String(r.title || '').trim();
+                  if (!url || !title) continue;
+                  items.push({
+                    url,
+                    title: title.slice(0, 500),
+                    content: String(r.content || '').slice(0, 2000),
+                    platform: classifyUrl(url),
+                    noun,
+                    batch_id: BATCH,
+                    searched_at: new Date().toISOString(),
+                  });
                 }
+                okQ++;
+              } catch {
+                errQ++;
               }
-              if (!found) errQ++;
               await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
             }
 
